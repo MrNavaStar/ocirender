@@ -146,12 +146,23 @@ pub fn load_manifest(image_dir: &Path) -> Result<OciManifest> {
             .context("manifest.json Layers must be an array")?
             .iter()
             .map(|layer| {
-                layer
-                    .as_str()
-                    .map(str::to_owned)
-                    .context("manifest.json Layers must contain strings")
+                if let Some(path) = layer.as_str() {
+                    return Ok((path.to_owned(), None));
+                }
+
+                let descriptor = layer
+                    .as_object()
+                    .context("manifest.json Layers must contain strings or objects")?;
+                let digest = json_field(descriptor, "digest")
+                    .and_then(serde_json::Value::as_str)
+                    .context("manifest.json layer object is missing digest")?
+                    .to_owned();
+                let media_type = json_field(descriptor, "mediatype")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                Ok((digest, media_type))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<(String, Option<String>)>>>()?;
         let layer_sources = json_field(manifest, "layersources")
             .map(|sources| {
                 sources
@@ -162,21 +173,27 @@ pub fn load_manifest(image_dir: &Path) -> Result<OciManifest> {
 
         let layers = layers
             .into_iter()
-            .map(|l| {
+            .map(|(l, object_media_type)| {
                 // Layer paths look like "blobs/sha256/<hex>".
                 // LayerSources keys look like "sha256:<hex>".
                 // Reconstruct the digest key from the path's final component.
-                let digest = l
-                    .rsplit('/')
-                    .next()
-                    .map(|hex| format!("sha256:{hex}"))
-                    .unwrap_or_default();
-                let media_type = layer_sources
-                    .and_then(|sources| sources.get(&digest))
-                    .and_then(|source| source.as_object())
-                    .and_then(|source| json_field(source, "mediatype"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
+                let digest = if l.contains(':') {
+                    l.clone()
+                } else {
+                    l.rsplit('/')
+                        .next()
+                        .map(|hex| format!("sha256:{hex}"))
+                        .unwrap_or_default()
+                };
+                let media_type = object_media_type
+                    .or_else(|| {
+                        layer_sources
+                            .and_then(|sources| sources.get(&digest))
+                            .and_then(|source| source.as_object())
+                            .and_then(|source| json_field(source, "mediatype"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
                     // Empty string signals "unknown"; resolve_layers will fall
                     // back to magic byte detection for this layer.
                     .unwrap_or_default();
