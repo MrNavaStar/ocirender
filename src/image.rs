@@ -17,7 +17,6 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -128,33 +127,40 @@ pub fn load_manifest(image_dir: &Path) -> Result<OciManifest> {
         // it is an array of objects (one per tagged image), each with a `Layers`
         // array of relative blob paths and an optional `LayerSources` map that
         // carries media types. We only process the first image in the array.
-        #[derive(Deserialize)]
-        struct LayerSource {
-            #[serde(rename = "mediaType")]
-            media_type: String,
-        }
-
-        #[derive(Deserialize)]
-        struct DockerManifest {
-            #[serde(rename = "Layers")]
-            layers: Vec<String>,
-            /// Present in Docker save layouts produced by newer Docker versions
-            /// and by skopeo. Maps digest (`sha256:<hex>`) to a layer descriptor
-            /// carrying the media type. Absent in older layouts.
-            #[serde(rename = "LayerSources", default)]
-            layer_sources: HashMap<String, LayerSource>,
-        }
-
         let data = std::fs::read_to_string(&manifest_path).context("reading manifest.json")?;
-        let manifests: Vec<DockerManifest> =
+        let root: serde_json::Value =
             serde_json::from_str(&data).context("parsing manifest.json")?;
-        let dm = manifests
-            .into_iter()
-            .next()
-            .context("manifest.json is empty")?;
+        let manifest = match root {
+            serde_json::Value::Array(mut manifests) => manifests
+                .drain(..)
+                .next()
+                .context("manifest.json is empty")?,
+            manifest => manifest,
+        };
+        let manifest = manifest
+            .as_object()
+            .context("manifest.json root must be an object or array")?;
+        let layers = json_field(manifest, "layers")
+            .context("manifest.json is missing Layers")?
+            .as_array()
+            .context("manifest.json Layers must be an array")?
+            .iter()
+            .map(|layer| {
+                layer
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("manifest.json Layers must contain strings")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let layer_sources = json_field(manifest, "layersources")
+            .map(|sources| {
+                sources
+                    .as_object()
+                    .context("manifest.json LayerSources must be an object")
+            })
+            .transpose()?;
 
-        let layers = dm
-            .layers
+        let layers = layers
             .into_iter()
             .map(|l| {
                 // Layer paths look like "blobs/sha256/<hex>".
@@ -165,10 +171,12 @@ pub fn load_manifest(image_dir: &Path) -> Result<OciManifest> {
                     .next()
                     .map(|hex| format!("sha256:{hex}"))
                     .unwrap_or_default();
-                let media_type = dm
-                    .layer_sources
-                    .get(&digest)
-                    .map(|s| s.media_type.clone())
+                let media_type = layer_sources
+                    .and_then(|sources| sources.get(&digest))
+                    .and_then(|source| source.as_object())
+                    .and_then(|source| json_field(source, "mediatype"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
                     // Empty string signals "unknown"; resolve_layers will fall
                     // back to magic byte detection for this layer.
                     .unwrap_or_default();
@@ -186,6 +194,17 @@ pub fn load_manifest(image_dir: &Path) -> Result<OciManifest> {
         "no index.json or manifest.json found in {}",
         image_dir.display()
     );
+}
+
+/// Find a JSON object field without making its spelling or casing significant.
+fn json_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    object
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value)
 }
 
 /// Resolve an [`OciDescriptor`] to an [`OciManifest`], following one level of
